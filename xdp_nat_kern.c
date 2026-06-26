@@ -1,331 +1,409 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * XDP NAT kernel program — SNAT/DNAT at line rate using eBPF.
+ *
+ * Packet flow
+ * ───────────
+ *   Outbound (internal → external)
+ *     src_ip:src_port  →  nat_ip:nat_port    (SNAT)
+ *     stored in nat_table (forward) and nat_reverse_table.
+ *
+ *   Inbound (external → internal)
+ *     dst_ip:dst_port  →  orig_ip:orig_port  (reverse DNAT)
+ *     looked up in nat_reverse_table.
+ *
+ * Requires Linux ≥ 5.8 (BPF_MAP_TYPE_LRU_HASH + BPF_MAP_TYPE_RINGBUF).
+ */
+
 #include <linux/bpf.h>
 #include <linux/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define MAX_CONNECTIONS 1000000
-#define PORT_POOL_SIZE 10000
-#define NAT_TABLE_SIZE 65536
+#include "nat_common.h"
 
-// NAT connection entry
-struct nat_entry {
-    __u32 orig_src_ip;
-    __u16 orig_src_port;
-    __u32 nat_ip;
-    __u16 nat_port;
-    __u64 timestamp;
-    __u8 protocol;
-};
+/* How many port-pool slots to probe per packet before giving up.
+ * A random start index is chosen so contention is spread across CPUs. */
+#define PORT_SEARCH_WINDOW 32
 
-// Connection key for hash lookup
-struct conn_key {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8 protocol;
-};
+/* ── Maps ───────────────────────────────────────────────────────────────── */
 
-// Statistics structure
-struct nat_stats {
-    __u64 packets_processed;
-    __u64 packets_translated;
-    __u64 packets_dropped;
-    __u64 new_connections;
-    __u64 port_exhausted;
-};
-
-// eBPF Maps
+/* Forward table: internal 5-tuple → nat_entry */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, NAT_TABLE_SIZE);
-    __type(key, struct conn_key);
+    __type(key,   struct conn_key);
     __type(value, struct nat_entry);
 } nat_table SEC(".maps");
 
+/* Reverse table: external 5-tuple → nat_entry.
+ * For ICMP, src_ip/src_port are zeroed — lookup is by (nat_ip, nat_id). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, NAT_TABLE_SIZE);
+    __type(key,   struct conn_key);
+    __type(value, struct nat_entry);
+} nat_reverse_table SEC(".maps");
+
+/* Port availability bitmap: index → 0 (free) / 1 (used) */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, PORT_POOL_SIZE);
-    __type(key, __u32);
-    __type(value, __u8);  // 0 = free, 1 = used
+    __type(key,   __u32);
+    __type(value, __u8);
 } port_pool SEC(".maps");
 
+/* Per-CPU stats — no locking needed */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
-    __type(key, __u32);
+    __type(key,   __u32);
     __type(value, struct nat_stats);
 } stats_map SEC(".maps");
 
-// Configuration map
-struct nat_config {
-    __u32 internal_network;
-    __u32 internal_netmask;
-    __u32 external_ip;
-    __u16 port_range_start;
-    __u16 port_range_end;
-    __u32 tcp_timeout;
-    __u32 udp_timeout;
-};
-
+/* Single config slot pushed by userspace */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
-    __type(key, __u32);
+    __type(key,   __u32);
     __type(value, struct nat_config);
 } config_map SEC(".maps");
 
-// Helper functions
-static __always_inline __u16 csum_fold_helper(__u64 csum) {
-    int i;
-#pragma unroll
-    for (i = 0; i < 4; i++) {
-        if (csum >> 16)
-            csum = (csum & 0xffff) + (csum >> 16);
-    }
-    return ~csum;
+/* Ring buffer for connection lifecycle events */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, RINGBUF_SIZE);
+} event_ring SEC(".maps");
+
+/* ── Checksum helpers ───────────────────────────────────────────────────── */
+
+static __always_inline __u16 csum_fold(__u64 csum) {
+    csum = (csum & 0xffff) + (csum >> 16);
+    csum = (csum & 0xffff) + (csum >> 16);
+    return ~(__u16)csum;
 }
 
-static __always_inline __u16 ipv4_csum(struct iphdr *iph) {
+static __always_inline __u16 ip_checksum(struct iphdr *iph) {
     iph->check = 0;
-    unsigned long long csum = bpf_csum_diff(0, 0, (unsigned int *)iph, sizeof(struct iphdr), 0);
-    return csum_fold_helper(csum);
+    __u64 csum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0);
+    return csum_fold(csum);
 }
 
-static __always_inline void update_l4_checksum(struct iphdr *iph, void *l4hdr, __u8 protocol,
-                                              __u32 old_addr, __u32 new_addr,
-                                              __u16 old_port, __u16 new_port) {
-    __u16 *checksum;
-    
-    if (protocol == IPPROTO_TCP) {
-        checksum = &((struct tcphdr *)l4hdr)->check;
-    } else if (protocol == IPPROTO_UDP) {
-        checksum = &((struct udphdr *)l4hdr)->check;
-        if (*checksum == 0) return; // UDP checksum is optional
+/* Incremental L4 checksum update: replace (old_ip, old_port) with new values.
+ * Operates in-place via the checksum pointer in the L4 header. */
+static __always_inline void l4_update_csum(void *l4hdr, __u8 proto,
+                                            __u32 old_ip,   __u32 new_ip,
+                                            __u16 old_port, __u16 new_port) {
+    __u16 *ck;
+    if (proto == IPPROTO_TCP) {
+        ck = &((struct tcphdr *)l4hdr)->check;
+    } else if (proto == IPPROTO_UDP) {
+        ck = &((struct udphdr *)l4hdr)->check;
+        if (*ck == 0)
+            return; /* UDP checksum optional (RFC 768) */
     } else {
         return;
     }
-    
-    // Update checksum for address change
-    unsigned long long csum = bpf_csum_diff((__be32 *)&old_addr, 4, (__be32 *)&new_addr, 4, ~(*checksum));
-    
-    // Update checksum for port change
-    csum = bpf_csum_diff((__be32 *)&old_port, 2, (__be32 *)&new_port, 2, csum);
-    
-    *checksum = csum_fold_helper(csum);
+    __u64 csum = bpf_csum_diff((__be32 *)&old_ip,   4, (__be32 *)&new_ip,   4, ~(*ck));
+    csum       = bpf_csum_diff((__be32 *)&old_port,  2, (__be32 *)&new_port, 2, csum);
+    *ck = csum_fold(csum);
 }
 
-static __always_inline __u16 allocate_port(void) {
-    __u32 key = 0;
-    struct nat_config *config = bpf_map_lookup_elem(&config_map, &key);
-    if (!config) return 0;
-    
-    // Simple port allocation - could be improved with better algorithm
-    for (__u16 port = config->port_range_start; port <= config->port_range_end; port++) {
-        __u32 port_key = port - config->port_range_start;
-        __u8 *status = bpf_map_lookup_elem(&port_pool, &port_key);
-        if (status && *status == 0) {
-            __u8 used = 1;
-            bpf_map_update_elem(&port_pool, &port_key, &used, BPF_ANY);
-            return port;
+/* Rewrite the ICMP echo identifier and fix the ICMP checksum in-place. */
+static __always_inline void icmp_rewrite_id(struct icmphdr *icmph,
+                                            __u16 old_id, __u16 new_id) {
+    __u64 csum = bpf_csum_diff((__be32 *)&old_id, 2, (__be32 *)&new_id, 2,
+                               ~((__u64)icmph->checksum));
+    icmph->checksum    = csum_fold(csum);
+    icmph->un.echo.id  = new_id;
+}
+
+/* ── Port pool ──────────────────────────────────────────────────────────── */
+
+/* Allocate one port from the pool using a randomised starting index.
+ * Returns the port in HOST byte order, or 0 on exhaustion. */
+static __always_inline __u16 port_alloc(struct nat_config *cfg) {
+    __u16 range = cfg->port_range_end - cfg->port_range_start;
+    __u32 start = bpf_get_prandom_u32() % ((__u32)range + 1);
+    int i;
+
+    for (i = 0; i < PORT_SEARCH_WINDOW; i++) {
+        __u32 idx = start + i;
+        if (idx > (__u32)range)
+            idx -= (__u32)range + 1;
+        if (idx >= PORT_POOL_SIZE)
+            continue;
+
+        __u8 *used = bpf_map_lookup_elem(&port_pool, &idx);
+        if (used && *used == 0) {
+            __u8 one = 1;
+            bpf_map_update_elem(&port_pool, &idx, &one, BPF_ANY);
+            return cfg->port_range_start + (__u16)idx;
         }
     }
-    return 0; // No ports available
+    return 0;
 }
 
-static __always_inline void free_port(__u16 port) {
-    __u32 key = 0;
-    struct nat_config *config = bpf_map_lookup_elem(&config_map, &key);
-    if (!config) return;
-    
-    if (port >= config->port_range_start && port <= config->port_range_end) {
-        __u32 port_key = port - config->port_range_start;
-        __u8 free = 0;
-        bpf_map_update_elem(&port_pool, &port_key, &free, BPF_ANY);
-    }
+static __always_inline void port_free(struct nat_config *cfg, __u16 port) {
+    if (port < cfg->port_range_start || port > cfg->port_range_end)
+        return;
+    __u32 idx = port - cfg->port_range_start;
+    if (idx >= PORT_POOL_SIZE)
+        return;
+    __u8 zero = 0;
+    bpf_map_update_elem(&port_pool, &idx, &zero, BPF_ANY);
 }
 
-static __always_inline void update_stats(__u64 *counter) {
-    __u32 key = 0;
-    struct nat_stats *stats = bpf_map_lookup_elem(&stats_map, &key);
-    if (stats) {
-        (*counter)++;
-    }
+/* ── Utility wrappers ───────────────────────────────────────────────────── */
+
+static __always_inline struct nat_stats *get_stats(void) {
+    __u32 k = 0;
+    return bpf_map_lookup_elem(&stats_map, &k);
 }
 
-static __always_inline int is_internal_ip(__u32 ip) {
-    __u32 key = 0;
-    struct nat_config *config = bpf_map_lookup_elem(&config_map, &key);
-    if (!config) return 0;
-    
-    return (ip & config->internal_netmask) == (config->internal_network & config->internal_netmask);
+static __always_inline struct nat_config *get_config(void) {
+    __u32 k = 0;
+    return bpf_map_lookup_elem(&config_map, &k);
 }
 
-// Main XDP program
+static __always_inline int is_internal(__u32 ip, struct nat_config *cfg) {
+    return (ip & cfg->internal_netmask) ==
+           (cfg->internal_network & cfg->internal_netmask);
+}
+
+/* Advance the TCP state machine based on observed flags byte. */
+static __always_inline __u8 tcp_advance(__u8 cur, __u8 flags) {
+    if (flags & 0x04) /* RST */
+        return TCP_STATE_RST;
+    if ((flags & 0x01) && cur == TCP_STATE_ESTAB) /* FIN from either side */
+        return TCP_STATE_FIN;
+    if ((flags & 0x12) == 0x12 && cur == TCP_STATE_NEW) /* SYN-ACK */
+        return TCP_STATE_ESTAB;
+    return cur;
+}
+
+/* Emit a connection event to the ring buffer (no-op when logging disabled). */
+static __always_inline void emit_event(struct nat_entry *e, __u32 remote_ip,
+                                        __u16 remote_port, __u8 type,
+                                        struct nat_config *cfg) {
+    if (!cfg->log_events)
+        return;
+    struct nat_event *ev = bpf_ringbuf_reserve(&event_ring, sizeof(*ev), 0);
+    if (!ev)
+        return;
+    ev->timestamp     = bpf_ktime_get_ns();
+    ev->orig_src_ip   = e->orig_src_ip;
+    ev->remote_ip     = remote_ip;
+    ev->nat_ip        = e->nat_ip;
+    ev->orig_src_port = e->orig_src_port;
+    ev->remote_port   = remote_port;
+    ev->nat_port      = e->nat_port;
+    ev->protocol      = e->protocol;
+    ev->event_type    = type;
+    bpf_ringbuf_submit(ev, 0);
+}
+
+/* ── Main XDP program ───────────────────────────────────────────────────── */
+
 SEC("xdp")
 int xdp_nat_prog(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
-    
-    // Parse Ethernet header
+    void *data     = (void *)(long)ctx->data;
+
+    /* ── Parse Ethernet ── */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return XDP_DROP;
-    
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
-    
-    // Parse IP header
+
+    /* ── Parse IP ── */
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_DROP;
-    
-    if (iph->version != 4)
+    if (iph->version != 4 || iph->ihl < 5)
         return XDP_PASS;
-    
-    // Only handle TCP, UDP, and ICMP
-    if (iph->protocol != IPPROTO_TCP && 
-        iph->protocol != IPPROTO_UDP && 
+    if (iph->protocol != IPPROTO_TCP &&
+        iph->protocol != IPPROTO_UDP &&
         iph->protocol != IPPROTO_ICMP)
         return XDP_PASS;
-    
-    void *l4_header = (void *)iph + (iph->ihl << 2);
+
+    struct nat_config *cfg = get_config();
+    if (!cfg)
+        return XDP_PASS;
+
+    struct nat_stats *stats = get_stats();
+    if (stats)
+        stats->packets_processed++;
+
+    /* ── Parse L4 ── */
+    void *l4 = (void *)iph + (iph->ihl << 2);
+    if (l4 > data_end)
+        return XDP_DROP;
+
     __u16 src_port = 0, dst_port = 0;
-    
-    // Extract port information
+    __u8  tcp_flags = 0;
+
     if (iph->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcph = l4_header;
+        struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return XDP_DROP;
-        src_port = tcph->source;
-        dst_port = tcph->dest;
+        src_port  = tcph->source;
+        dst_port  = tcph->dest;
+        tcp_flags = ((__u8 *)tcph)[13]; /* flags byte: URG ACK PSH RST SYN FIN */
     } else if (iph->protocol == IPPROTO_UDP) {
-        struct udphdr *udph = l4_header;
+        struct udphdr *udph = l4;
         if ((void *)(udph + 1) > data_end)
             return XDP_DROP;
         src_port = udph->source;
         dst_port = udph->dest;
-    } else if (iph->protocol == IPPROTO_ICMP) {
-        struct icmphdr *icmph = l4_header;
+    } else { /* ICMP */
+        struct icmphdr *icmph = l4;
         if ((void *)(icmph + 1) > data_end)
             return XDP_DROP;
-        src_port = dst_port = 0; // ICMP doesn't have ports
+        /* Only translate echo request/reply; pass other ICMP types up. */
+        if (icmph->type != ICMP_ECHO && icmph->type != ICMP_ECHOREPLY)
+            return XDP_PASS;
+        /* Treat the ICMP identifier as the "port" for lookup purposes. */
+        src_port = dst_port = icmph->un.echo.id;
     }
-    
-    // Create connection key
-    struct conn_key key = {
-        .src_ip = iph->saddr,
-        .dst_ip = iph->daddr,
-        .src_port = src_port,
-        .dst_port = dst_port,
-        .protocol = iph->protocol,
-    };
-    
-    // Update packet counter
-    __u32 stats_key = 0;
-    struct nat_stats *stats = bpf_map_lookup_elem(&stats_map, &stats_key);
-    if (stats) {
-        stats->packets_processed++;
-    }
-    
-    // Check if this is outbound traffic (from internal network)
-    int outbound = is_internal_ip(iph->saddr);
-    
+
+    int outbound = is_internal(iph->saddr, cfg);
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * OUTBOUND PATH — SNAT: rewrite source IP and port.
+     * ═══════════════════════════════════════════════════════════════════ */
     if (outbound) {
-        // Outbound traffic - apply SNAT
-        struct nat_entry *entry = bpf_map_lookup_elem(&nat_table, &key);
-        
-        if (!entry) {
-            // New connection - create NAT entry
-            struct nat_entry new_entry = {0};
-            __u16 nat_port = allocate_port();
-            
-            if (nat_port == 0) {
-                // Port pool exhausted
-                if (stats) stats->port_exhausted++;
-                return XDP_DROP;
-            }
-            
-            __u32 config_key = 0;
-            struct nat_config *config = bpf_map_lookup_elem(&config_map, &config_key);
-            if (!config) return XDP_DROP;
-            
-            new_entry.orig_src_ip = iph->saddr;
-            new_entry.orig_src_port = src_port;
-            new_entry.nat_ip = config->external_ip;
-            new_entry.nat_port = bpf_htons(nat_port);
-            new_entry.timestamp = bpf_ktime_get_ns();
-            new_entry.protocol = iph->protocol;
-            
-            bpf_map_update_elem(&nat_table, &key, &new_entry, BPF_NOEXIST);
-            entry = &new_entry;
-            
-            if (stats) stats->new_connections++;
-        }
-        
-        // Apply SNAT translation
-        __u32 old_saddr = iph->saddr;
-        __u16 old_sport = src_port;
-        
-        iph->saddr = entry->nat_ip;
-        
-        if (iph->protocol == IPPROTO_TCP) {
-            ((struct tcphdr *)l4_header)->source = entry->nat_port;
-        } else if (iph->protocol == IPPROTO_UDP) {
-            ((struct udphdr *)l4_header)->source = entry->nat_port;
-        }
-        
-        // Update checksums
-        iph->check = ipv4_csum(iph);
-        if (iph->protocol != IPPROTO_ICMP) {
-            update_l4_checksum(iph, l4_header, iph->protocol,
-                             old_saddr, entry->nat_ip,
-                             old_sport, entry->nat_port);
-        }
-        
-    } else {
-        // Inbound traffic - look for reverse NAT entry
-        struct conn_key reverse_key = {
-            .src_ip = iph->daddr,  // Swap src/dst for reverse lookup
-            .dst_ip = iph->saddr,
-            .src_port = dst_port,
-            .dst_port = src_port,
+        struct conn_key fwd_key = {
+            .src_ip   = iph->saddr,
+            .dst_ip   = iph->daddr,
+            .src_port = src_port,
+            .dst_port = dst_port,
             .protocol = iph->protocol,
         };
-        
-        struct nat_entry *entry = bpf_map_lookup_elem(&nat_table, &reverse_key);
+
+        struct nat_entry *entry = bpf_map_lookup_elem(&nat_table, &fwd_key);
+        struct nat_entry  tmp;
+
         if (!entry) {
-            // No NAT entry found - pass through
-            return XDP_PASS;
+            /* ── New connection: allocate a port and create both entries ── */
+            __u16 nat_port = port_alloc(cfg);
+            if (nat_port == 0) {
+                if (stats) {
+                    stats->port_exhausted++;
+                    stats->packets_dropped++;
+                }
+                struct nat_entry exhaust_ev = {
+                    .orig_src_ip = iph->saddr,
+                    .nat_ip      = cfg->external_ip,
+                    .protocol    = iph->protocol,
+                };
+                emit_event(&exhaust_ev, iph->daddr, dst_port,
+                           NAT_EVT_PORT_EXHAUST, cfg);
+                return XDP_DROP;
+            }
+
+            tmp = (struct nat_entry){
+                .orig_src_ip   = iph->saddr,
+                .orig_src_port = src_port,
+                .nat_ip        = cfg->external_ip,
+                .nat_port      = bpf_htons(nat_port),
+                .last_seen     = bpf_ktime_get_ns(),
+                .protocol      = iph->protocol,
+                .tcp_state     = TCP_STATE_NEW,
+            };
+
+            /* Forward entry */
+            bpf_map_update_elem(&nat_table, &fwd_key, &tmp, BPF_NOEXIST);
+
+            /* Reverse entry key: (remote_ip, nat_ip, remote_port, nat_port).
+             * ICMP uses zero for remote_ip/remote_port — lookup by nat_id only. */
+            struct conn_key rev_key = {
+                .src_ip   = (iph->protocol == IPPROTO_ICMP) ? 0 : iph->daddr,
+                .dst_ip   = cfg->external_ip,
+                .src_port = (iph->protocol == IPPROTO_ICMP) ? 0 : dst_port,
+                .dst_port = bpf_htons(nat_port),
+                .protocol = iph->protocol,
+            };
+            bpf_map_update_elem(&nat_reverse_table, &rev_key, &tmp, BPF_ANY);
+
+            if (stats) stats->new_connections++;
+            emit_event(&tmp, iph->daddr, dst_port, NAT_EVT_NEW_CONN, cfg);
+
+            entry = &tmp;
+        } else {
+            /* Existing connection: refresh timestamp and TCP state. */
+            entry->last_seen = bpf_ktime_get_ns();
+            if (iph->protocol == IPPROTO_TCP)
+                entry->tcp_state = tcp_advance(entry->tcp_state, tcp_flags);
         }
-        
-        // Apply reverse NAT translation
-        __u32 old_daddr = iph->daddr;
-        __u16 old_dport = dst_port;
-        
-        iph->daddr = entry->orig_src_ip;
-        
+
+        /* ── Apply SNAT ── */
+        __u32 old_sip   = iph->saddr;
+        __u16 old_sport = src_port;
+
+        iph->saddr = entry->nat_ip;
+        iph->check = ip_checksum(iph);
+
         if (iph->protocol == IPPROTO_TCP) {
-            ((struct tcphdr *)l4_header)->dest = entry->orig_src_port;
+            ((struct tcphdr *)l4)->source = entry->nat_port;
+            l4_update_csum(l4, IPPROTO_TCP,
+                           old_sip, entry->nat_ip, old_sport, entry->nat_port);
         } else if (iph->protocol == IPPROTO_UDP) {
-            ((struct udphdr *)l4_header)->dest = entry->orig_src_port;
+            ((struct udphdr *)l4)->source = entry->nat_port;
+            l4_update_csum(l4, IPPROTO_UDP,
+                           old_sip, entry->nat_ip, old_sport, entry->nat_port);
+        } else { /* ICMP */
+            icmp_rewrite_id(l4, old_sport, entry->nat_port);
+            if (stats) stats->icmp_translated++;
         }
-        
-        // Update checksums
-        iph->check = ipv4_csum(iph);
-        if (iph->protocol != IPPROTO_ICMP) {
-            update_l4_checksum(iph, l4_header, iph->protocol,
-                             old_daddr, entry->orig_src_ip,
-                             old_dport, entry->orig_src_port);
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * INBOUND PATH — reverse DNAT: rewrite destination IP and port.
+     * ═══════════════════════════════════════════════════════════════════ */
+    } else {
+        struct conn_key rev_key = {
+            .src_ip   = (iph->protocol == IPPROTO_ICMP) ? 0 : iph->saddr,
+            .dst_ip   = iph->daddr,
+            .src_port = (iph->protocol == IPPROTO_ICMP) ? 0 : src_port,
+            .dst_port = dst_port,
+            .protocol = iph->protocol,
+        };
+
+        struct nat_entry *entry = bpf_map_lookup_elem(&nat_reverse_table, &rev_key);
+        if (!entry)
+            return XDP_PASS; /* not a NATted flow — let kernel handle it */
+
+        entry->last_seen = bpf_ktime_get_ns();
+        if (iph->protocol == IPPROTO_TCP)
+            entry->tcp_state = tcp_advance(entry->tcp_state, tcp_flags);
+
+        /* ── Apply reverse DNAT ── */
+        __u32 old_dip   = iph->daddr;
+        __u16 old_dport = dst_port;
+
+        iph->daddr = entry->orig_src_ip;
+        iph->check = ip_checksum(iph);
+
+        if (iph->protocol == IPPROTO_TCP) {
+            ((struct tcphdr *)l4)->dest = entry->orig_src_port;
+            l4_update_csum(l4, IPPROTO_TCP,
+                           old_dip, entry->orig_src_ip, old_dport, entry->orig_src_port);
+        } else if (iph->protocol == IPPROTO_UDP) {
+            ((struct udphdr *)l4)->dest = entry->orig_src_port;
+            l4_update_csum(l4, IPPROTO_UDP,
+                           old_dip, entry->orig_src_ip, old_dport, entry->orig_src_port);
+        } else { /* ICMP */
+            icmp_rewrite_id(l4, old_dport, entry->orig_src_port);
+            if (stats) stats->icmp_translated++;
         }
     }
-    
+
     if (stats) stats->packets_translated++;
     return XDP_PASS;
 }
