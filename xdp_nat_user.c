@@ -259,11 +259,7 @@ static void dump_connections(void) {
     }
 }
 
-/*
- * Walk the forward table and remove entries that have exceeded their timeout.
- * Collect first, then delete — bpf_map_get_next_key is undefined after
- * deleting the current key on a hash map.
- */
+/* TODO: bump CLEANUP_BATCH or run multiple passes for large tables */
 #define CLEANUP_BATCH 256
 
 static int cleanup_expired(void) {

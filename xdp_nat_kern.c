@@ -115,6 +115,7 @@ static __always_inline __u16 port_alloc(struct nat_config *cfg) {
     return 0;
 }
 
+/* TODO: call this from the kernel side on RST/FIN instead of waiting for userspace cleanup */
 static __always_inline void port_free(struct nat_config *cfg, __u16 port) {
     if (port < cfg->port_range_start || port > cfg->port_range_end)
         return;
@@ -123,16 +124,6 @@ static __always_inline void port_free(struct nat_config *cfg, __u16 port) {
         return;
     __u8 zero = 0;
     bpf_map_update_elem(&port_pool, &idx, &zero, BPF_ANY);
-}
-
-static __always_inline struct nat_stats *get_stats(void) {
-    __u32 k = 0;
-    return bpf_map_lookup_elem(&stats_map, &k);
-}
-
-static __always_inline struct nat_config *get_config(void) {
-    __u32 k = 0;
-    return bpf_map_lookup_elem(&config_map, &k);
 }
 
 static __always_inline int is_internal(__u32 ip, struct nat_config *cfg) {
@@ -158,15 +149,15 @@ static __always_inline void emit_event(struct nat_entry *e, __u32 remote_ip,
     struct nat_event *ev = bpf_ringbuf_reserve(&event_ring, sizeof(*ev), 0);
     if (!ev)
         return;
-    ev->timestamp     = bpf_ktime_get_ns();
-    ev->orig_src_ip   = e->orig_src_ip;
-    ev->remote_ip     = remote_ip;
-    ev->nat_ip        = e->nat_ip;
+    ev->timestamp = bpf_ktime_get_ns();
+    ev->orig_src_ip = e->orig_src_ip;
+    ev->remote_ip = remote_ip;
+    ev->nat_ip = e->nat_ip;
     ev->orig_src_port = e->orig_src_port;
-    ev->remote_port   = remote_port;
-    ev->nat_port      = e->nat_port;
-    ev->protocol      = e->protocol;
-    ev->event_type    = type;
+    ev->remote_port = remote_port;
+    ev->nat_port = e->nat_port;
+    ev->protocol = e->protocol;
+    ev->event_type = type;
     bpf_ringbuf_submit(ev, 0);
 }
 
@@ -191,11 +182,12 @@ int xdp_nat_prog(struct xdp_md *ctx) {
         iph->protocol != IPPROTO_ICMP)
         return XDP_PASS;
 
-    struct nat_config *cfg = get_config();
+    __u32 zero = 0;
+    struct nat_config *cfg = bpf_map_lookup_elem(&config_map, &zero);
     if (!cfg)
         return XDP_PASS;
 
-    struct nat_stats *stats = get_stats();
+    struct nat_stats *stats = bpf_map_lookup_elem(&stats_map, &zero);
     if (stats)
         stats->packets_processed++;
 
@@ -228,6 +220,7 @@ int xdp_nat_prog(struct xdp_md *ctx) {
         src_port = dst_port = icmph->un.echo.id;
     }
 
+    /* bpf_printk("saddr=%x daddr=%x proto=%d\n", iph->saddr, iph->daddr, iph->protocol); */
     int outbound = is_internal(iph->saddr, cfg);
 
     if (outbound) {

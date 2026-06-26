@@ -26,7 +26,6 @@ typedef unsigned long long __u64;
 #define NAT_EVT_DEL_CONN     1
 #define NAT_EVT_PORT_EXHAUST 2
 
-/* pad[3] keeps the key byte-comparable across CPUs */
 struct conn_key {
     __u32 src_ip;
     __u32 dst_ip;
