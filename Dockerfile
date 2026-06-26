@@ -1,4 +1,3 @@
-# ── Stage 1: build ──────────────────────────────────────────────────────────
 FROM ubuntu:22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,12 +12,10 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-# linux-libc-dev installs /usr/include/linux/, /usr/include/asm/ etc.
-# Pass KERNEL_HEADERS=/usr so the Makefile searches /usr/include directly,
-# avoiding any dependency on the host kernel version during the Docker build.
+# linux-libc-dev ships /usr/include/linux/ so we point KERNEL_HEADERS there
+# instead of needing the host kernel headers at build time.
 RUN make KERNEL_HEADERS=/usr
 
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -33,7 +30,6 @@ WORKDIR /opt/nat-ebpf-xdp
 COPY --from=builder /src/xdp_nat_kern.o .
 COPY --from=builder /src/xdp_nat_user  .
 
-# The tool requires CAP_SYS_ADMIN and access to the host network.
-# Run with: docker run --privileged --network host nat-ebpf-xdp
+# requires --privileged and --network host to load into the host kernel
 ENTRYPOINT ["/opt/nat-ebpf-xdp/xdp_nat_user"]
 CMD ["--help"]

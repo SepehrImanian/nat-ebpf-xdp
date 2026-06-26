@@ -1,17 +1,9 @@
-# ────────────────────────────────────────────────────────────────────────────
-# eBPF XDP NAT — Docker Compose
-#
-# IMPORTANT: eBPF programs must load into the HOST kernel.
-# The container must run with --privileged and --network host so that:
-#   • The XDP program is loaded into the real host NIC
-#   • eBPF maps are accessible in the host kernel context
-#
+# eBPF programs load into the HOST kernel, so privileged + host network are required.
 # Usage:
-#   docker compose up nat          # foreground, print stats
-#   docker compose up -d nat       # daemon / background cleanup loop
-#   docker compose run nat --conns # dump active NAT sessions
-#   docker compose run nat --stats # print counters
-# ────────────────────────────────────────────────────────────────────────────
+#   docker compose up nat
+#   docker compose up -d nat
+#   docker compose run nat --conns
+#   docker compose run nat --stats
 
 x-nat-base: &nat-base
   build:
@@ -21,12 +13,11 @@ x-nat-base: &nat-base
   network_mode: host
   privileged: true
   volumes:
-    - /sys/fs/bpf:/sys/fs/bpf          # BPF filesystem (pin maps)
-    - /proc:/proc:ro                    # proc access for kernel info
+    - /sys/fs/bpf:/sys/fs/bpf
+    - /proc:/proc:ro
 
 services:
 
-  # ── Primary service: attach + daemon cleanup loop ─────────────────────────
   nat:
     <<: *nat-base
     container_name: xdp-nat
@@ -52,7 +43,6 @@ services:
       - INT_NETWORK=${INT_NETWORK:-192.168.1.0/24}
       - EXT_IP=${EXT_IP:-203.0.113.1}
 
-  # ── Monitor mode: stream ring-buffer events to stdout ─────────────────────
   monitor:
     <<: *nat-base
     container_name: xdp-nat-monitor
@@ -67,7 +57,6 @@ services:
       - --log-events
       - --monitor
 
-  # ── Stats: print counters and exit ────────────────────────────────────────
   stats:
     <<: *nat-base
     container_name: xdp-nat-stats

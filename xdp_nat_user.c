@@ -1,14 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * XDP NAT userspace control tool.
- *
- * Loads the eBPF program, configures it, then:
- *   - (default)   prints statistics every 5 seconds
- *   - --daemon    runs cleanup loop every 30 seconds
- *   - --stats     prints stats once and exits
- *   - --conns     dumps the active NAT table and exits
- *   - --monitor   streams new-connection events via ring buffer
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,13 +13,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <linux/if_link.h>   /* XDP_FLAGS_DRV_MODE, XDP_FLAGS_SKB_MODE */
+#include <linux/if_link.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
 #include "nat_common.h"
-
-/* ── Globals ────────────────────────────────────────────────────────────── */
 
 static int    ifindex        = -1;
 static __u32  xdp_flags_used = 0;
@@ -45,16 +33,11 @@ static int json_output = 0;
 
 static void signal_handler(int sig) { (void)sig; keep_running = 0; }
 
-/* ── Time helper ────────────────────────────────────────────────────────── */
-
-/* Returns monotonic clock in nanoseconds (same epoch as bpf_ktime_get_ns). */
 static __u64 mono_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
 }
-
-/* ── Config loading ─────────────────────────────────────────────────────── */
 
 static int load_config(const char *internal_net, const char *external_ip,
                        int port_start, int port_end,
@@ -62,7 +45,6 @@ static int load_config(const char *internal_net, const char *external_ip,
                        int log_events) {
     struct nat_config cfg = {0};
 
-    /* Parse "a.b.c.d/prefix" */
     char net_str[32];
     strncpy(net_str, internal_net, sizeof(net_str) - 1);
     char *slash = strchr(net_str, '/');
@@ -126,9 +108,6 @@ static int load_config(const char *internal_net, const char *external_ip,
     return 0;
 }
 
-/* ── Statistics ─────────────────────────────────────────────────────────── */
-
-/* Aggregate per-CPU counters into a single struct. */
 static int read_stats(struct nat_stats *out) {
     int ncpus = libbpf_num_possible_cpus();
     if (ncpus <= 0)
@@ -196,8 +175,6 @@ static void print_stats(void) {
         printf("======================\n");
     }
 }
-
-/* ── Connection table dump ──────────────────────────────────────────────── */
 
 static const char *proto_name(__u8 proto) {
     if (proto == IPPROTO_TCP)  return "TCP";
@@ -282,15 +259,10 @@ static void dump_connections(void) {
     }
 }
 
-/* ── Expired connection cleanup ─────────────────────────────────────────── */
-
 /*
- * Walk the forward NAT table, collect entries whose last_seen exceeds the
- * configured timeout, then delete them from both tables and free their ports.
- * Returns the number of entries removed.
- *
- * Note: bpf_map_get_next_key on a hash map is undefined after a delete of
- * the current key, so we collect first, then delete.
+ * Walk the forward table and remove entries that have exceeded their timeout.
+ * Collect first, then delete — bpf_map_get_next_key is undefined after
+ * deleting the current key on a hash map.
  */
 #define CLEANUP_BATCH 256
 
@@ -321,7 +293,6 @@ static int cleanup_expired(void) {
             else
                 timeout_ns = (__u64)cfg.icmp_timeout * 1000000000ULL;
 
-            /* Also fast-expire RST/FIN connections */
             if (e.tcp_state == TCP_STATE_RST || e.tcp_state == TCP_STATE_FIN)
                 timeout_ns = 10ULL * 1000000000ULL;
 
@@ -334,7 +305,6 @@ static int cleanup_expired(void) {
         cur = next;
     }
 
-    /* Delete collected entries */
     int ncpus = libbpf_num_possible_cpus();
     struct nat_stats *percpu = calloc(ncpus, sizeof(*percpu));
 
@@ -344,7 +314,6 @@ static int cleanup_expired(void) {
 
         bpf_map_delete_elem(nat_table_fd, k);
 
-        /* Remove corresponding reverse entry */
         struct conn_key rev = {
             .src_ip   = (e->protocol == IPPROTO_ICMP) ? 0 : k->dst_ip,
             .dst_ip   = e->nat_ip,
@@ -354,7 +323,6 @@ static int cleanup_expired(void) {
         };
         bpf_map_delete_elem(nat_rev_fd, &rev);
 
-        /* Free the port in the pool */
         __u16 port = ntohs(e->nat_port);
         if (port >= cfg.port_range_start && port <= cfg.port_range_end) {
             __u32 idx = port - cfg.port_range_start;
@@ -362,7 +330,6 @@ static int cleanup_expired(void) {
             bpf_map_update_elem(port_pool_fd, &idx, &zero, BPF_ANY);
         }
 
-        /* Increment expired counter in per-CPU stats */
         if (percpu) {
             int stats_key = 0;
             if (bpf_map_lookup_elem(stats_fd, &stats_key, percpu) == 0) {
@@ -380,8 +347,6 @@ static int cleanup_expired(void) {
     return n;
 }
 
-/* ── Ring buffer event handler ──────────────────────────────────────────── */
-
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     (void)ctx; (void)data_sz;
     struct nat_event *ev = data;
@@ -393,10 +358,10 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
 
     const char *type;
     switch (ev->event_type) {
-    case NAT_EVT_NEW_CONN:     type = "NEW";      break;
-    case NAT_EVT_DEL_CONN:     type = "DEL";      break;
-    case NAT_EVT_PORT_EXHAUST: type = "EXHAUST";  break;
-    default:                   type = "?";        break;
+    case NAT_EVT_NEW_CONN:     type = "NEW";     break;
+    case NAT_EVT_DEL_CONN:     type = "DEL";     break;
+    case NAT_EVT_PORT_EXHAUST: type = "EXHAUST"; break;
+    default:                   type = "?";       break;
     }
 
     if (json_output) {
@@ -418,8 +383,6 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
     fflush(stdout);
     return 0;
 }
-
-/* ── Usage ──────────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog) {
     printf(
@@ -451,18 +414,11 @@ static void usage(const char *prog) {
         "  -h, --help                 Show this help\n"
         "\n"
         "Examples:\n"
-        "  # Basic NAT\n"
         "  sudo %s -i eth0 -n 192.168.1.0/24 -e 203.0.113.1\n"
-        "\n"
-        "  # Monitor new connections\n"
         "  sudo %s -i eth0 -n 192.168.1.0/24 -e 203.0.113.1 -L -m\n"
-        "\n"
-        "  # Dump active sessions as JSON\n"
         "  sudo %s -i eth0 -c -j\n",
         prog, prog, prog, prog);
 }
-
-/* ── BPF load / attach helpers ──────────────────────────────────────────── */
 
 static int get_map_fd(const char *name) {
     struct bpf_map *m = bpf_object__find_map_by_name(obj, name);
@@ -475,7 +431,6 @@ static int get_map_fd(const char *name) {
 
 static void detach_xdp(void) {
     if (ifindex > 0) {
-        /* bpf_set_link_xdp_fd with fd=-1 detaches the XDP program */
         bpf_set_link_xdp_fd(ifindex, -1, xdp_flags_used);
         ifindex = -1;
     }
@@ -488,8 +443,6 @@ static void cleanup(void) {
         obj = NULL;
     }
 }
-
-/* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
     const char *interface    = NULL;
@@ -564,14 +517,12 @@ int main(int argc, char **argv) {
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* Allow BPF maps to lock memory */
     struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
     if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
         fprintf(stderr, "setrlimit(RLIMIT_MEMLOCK): %s\n", strerror(errno));
         return 1;
     }
 
-    /* Load BPF object */
     obj = bpf_object__open_file("xdp_nat_kern.o", NULL);
     if (libbpf_get_error(obj)) {
         fprintf(stderr, "Failed to open xdp_nat_kern.o\n");
@@ -583,7 +534,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Collect map FDs */
     nat_table_fd  = get_map_fd("nat_table");
     nat_rev_fd    = get_map_fd("nat_reverse_table");
     port_pool_fd  = get_map_fd("port_pool");
@@ -597,7 +547,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ── Modes that only read state (no attach needed) ── */
     if (show_stats) {
         print_stats();
         bpf_object__close(obj);
@@ -609,7 +558,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ── Modes that need a running program ── */
     if (!internal_net || !external_ip) {
         fprintf(stderr, "Error: --network and --external-ip are required\n");
         usage(argv[0]);
@@ -623,7 +571,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Find and attach XDP program */
     struct bpf_program *prog =
         bpf_object__find_program_by_name(obj, "xdp_nat_prog");
     if (!prog) {
@@ -633,9 +580,7 @@ int main(int argc, char **argv) {
     }
     int prog_fd = bpf_program__fd(prog);
 
-    /* Try native driver mode first; fall back to generic (SKB) mode.
-     * bpf_set_link_xdp_fd is the libbpf 0.5-compatible attach API
-     * (bpf_xdp_attach was added in 0.7 and is not available on Ubuntu 22.04). */
+    /* try native driver mode first; fall back to generic SKB mode */
     if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) == 0) {
         xdp_flags_used = XDP_FLAGS_DRV_MODE;
         printf("XDP attached in native driver mode\n");
@@ -651,7 +596,6 @@ int main(int argc, char **argv) {
     printf("XDP NAT running on %s (pid %d)\n", interface, getpid());
     printf("Press Ctrl-C to stop\n\n");
 
-    /* ── Monitor mode: consume ring buffer events ── */
     if (monitor_mode) {
         if (!log_events) {
             fprintf(stderr, "Warning: --log-events not set; no events will fire."
@@ -665,7 +609,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         while (keep_running) {
-            int err = ring_buffer__poll(rb, 100 /* ms */);
+            int err = ring_buffer__poll(rb, 100);
             if (err < 0 && err != -EINTR)
                 break;
         }
@@ -675,7 +619,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ── Daemon mode: periodic cleanup, no stats printing ── */
     if (daemon_mode) {
         printf("Running in daemon mode (cleanup every 30 s)\n");
         while (keep_running) {
@@ -683,7 +626,6 @@ int main(int argc, char **argv) {
             cleanup_expired();
         }
     } else {
-        /* Interactive mode: print stats every 5 s */
         while (keep_running) {
             sleep(5);
             print_stats();
