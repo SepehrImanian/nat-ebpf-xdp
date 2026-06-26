@@ -5,18 +5,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     clang llvm libbpf-dev \
-    linux-headers-generic \
+    linux-libc-dev \
     libelf-dev zlib1g-dev \
     make ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Use generic kernel headers for the eBPF build (the .o runs on the host kernel)
-ENV KERNEL_HEADERS=/usr/src/linux-headers-generic
-
 WORKDIR /src
 COPY . .
 
-RUN make
+# linux-libc-dev installs /usr/include/linux/, /usr/include/asm/ etc.
+# Pass KERNEL_HEADERS=/usr so the Makefile searches /usr/include directly,
+# avoiding any dependency on the host kernel version during the Docker build.
+RUN make KERNEL_HEADERS=/usr
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM ubuntu:22.04

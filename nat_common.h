@@ -9,11 +9,19 @@
  */
 
 #ifndef __KERNEL__
+#ifdef __linux__
+/* linux/types.h defines __u64 as unsigned long long, matching the kernel
+ * convention.  Using stdint.h's uint64_t (= unsigned long on x86-64 glibc)
+ * causes a typedef conflict when BPF or kernel headers are also included. */
+#include <linux/types.h>
+#else
+/* Non-Linux (macOS, etc.) — provide compatible definitions manually. */
 #include <stdint.h>
-typedef uint8_t  __u8;
-typedef uint16_t __u16;
-typedef uint32_t __u32;
-typedef uint64_t __u64;
+typedef uint8_t            __u8;
+typedef uint16_t           __u16;
+typedef uint32_t           __u32;
+typedef unsigned long long __u64;
+#endif
 #endif
 
 /* ── Map sizing ─────────────────────────────────────────────────────────── */

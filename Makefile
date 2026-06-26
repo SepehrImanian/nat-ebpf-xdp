@@ -1,11 +1,34 @@
 # Makefile — eBPF XDP NAT
+SHELL   := /bin/bash
 CC      := clang
 CFLAGS  := -O2 -g -Wall -Werror
 
-# Detect kernel headers path
+# Detect kernel headers path.
+# KERNEL_HEADERS can be overridden on the command line, e.g.:
+#   make KERNEL_HEADERS=/usr    (Dockerfile build against linux-libc-dev)
 KVER            := $(shell uname -r)
-KERNEL_HEADERS  := /usr/src/linux-headers-$(KVER)
+KERNEL_HEADERS  ?= /usr/src/linux-headers-$(KVER)
 LIBBPF_DIR      := /usr/include
+
+# Architecture-specific kernel header subdirectory (x86_64 → x86, aarch64 → arm64)
+ARCH := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+
+# On Debian/Ubuntu, architecture-specific headers (asm/types.h etc.) live in
+# /usr/include/<machine>-linux-gnu/ rather than /usr/include/asm/ directly.
+# $(wildcard ...) returns empty string if the path does not exist, so this is
+# safe even on non-Debian systems.
+ARCH_TRIPLE   := $(shell uname -m)-linux-gnu
+MULTIARCH_INC := $(wildcard /usr/include/$(ARCH_TRIPLE))
+
+# On Ubuntu the flavor-specific package (linux-headers-X.X.X-YY-azure) does not
+# ship arch/ headers; those live in the common package (linux-headers-X.X.X-YY).
+# Strip the trailing flavor word (anything matching -[alpha][alnum]*) to find it.
+# If that directory does not exist, fall back to KERNEL_HEADERS.
+KVER_COMMON   := $(shell echo $(KVER) | sed 's/-[a-zA-Z][a-zA-Z0-9]*$$//')
+KERNEL_COMMON := $(shell \
+    test -d /usr/src/linux-headers-$(KVER_COMMON) \
+    && echo /usr/src/linux-headers-$(KVER_COMMON) \
+    || echo $(KERNEL_HEADERS))
 
 # eBPF kernel program flags
 BPF_CFLAGS := \
@@ -33,9 +56,12 @@ SRCS_USER := xdp_nat_user.c nat_common.h
 all: xdp_nat_kern.o xdp_nat_user
 
 xdp_nat_kern.o: $(SRCS_KERN)
-	$(CC) $(BPF_CFLAGS) \
+	set -o pipefail; $(CC) $(BPF_CFLAGS) \
 	    -I$(LIBBPF_DIR) \
+	    $(if $(MULTIARCH_INC),-I$(MULTIARCH_INC)) \
 	    -I$(KERNEL_HEADERS)/include \
+	    -I$(KERNEL_COMMON)/arch/$(ARCH)/include \
+	    -I$(KERNEL_COMMON)/arch/$(ARCH)/include/generated \
 	    -c xdp_nat_kern.c -o - \
 	    | llc -march=bpf -filetype=obj -o $@
 

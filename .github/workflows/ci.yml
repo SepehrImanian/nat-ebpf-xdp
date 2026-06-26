@@ -20,6 +20,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libbpf-dev \
             linux-headers-$(uname -r) \
+            linux-libc-dev \
             libelf-dev zlib1g-dev
 
       - name: Build kernel eBPF object
@@ -101,6 +102,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang llvm libbpf-dev \
             linux-headers-$(uname -r) \
+            linux-libc-dev \
             libelf-dev zlib1g-dev
 
       - name: Build release artifacts

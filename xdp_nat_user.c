@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <linux/if_link.h>   /* XDP_FLAGS_DRV_MODE, XDP_FLAGS_SKB_MODE */
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
@@ -30,8 +31,8 @@
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
 
-static int ifindex        = -1;
-static int xdp_flags_used = 0;
+static int    ifindex        = -1;
+static __u32  xdp_flags_used = 0;
 static struct bpf_object *obj  = NULL;
 static int nat_table_fd        = -1;
 static int nat_rev_fd          = -1;
@@ -474,7 +475,8 @@ static int get_map_fd(const char *name) {
 
 static void detach_xdp(void) {
     if (ifindex > 0) {
-        bpf_xdp_detach(ifindex, xdp_flags_used, NULL);
+        /* bpf_set_link_xdp_fd with fd=-1 detaches the XDP program */
+        bpf_set_link_xdp_fd(ifindex, -1, xdp_flags_used);
         ifindex = -1;
     }
 }
@@ -631,11 +633,13 @@ int main(int argc, char **argv) {
     }
     int prog_fd = bpf_program__fd(prog);
 
-    /* Try native driver mode first; fall back to generic (SKB) mode */
-    if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL) == 0) {
+    /* Try native driver mode first; fall back to generic (SKB) mode.
+     * bpf_set_link_xdp_fd is the libbpf 0.5-compatible attach API
+     * (bpf_xdp_attach was added in 0.7 and is not available on Ubuntu 22.04). */
+    if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) == 0) {
         xdp_flags_used = XDP_FLAGS_DRV_MODE;
         printf("XDP attached in native driver mode\n");
-    } else if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL) == 0) {
+    } else if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_SKB_MODE) == 0) {
         xdp_flags_used = XDP_FLAGS_SKB_MODE;
         printf("XDP attached in generic (SKB) mode\n");
     } else {
