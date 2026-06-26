@@ -1,0 +1,82 @@
+version: "3.9"
+
+# ────────────────────────────────────────────────────────────────────────────
+# eBPF XDP NAT — Docker Compose
+#
+# IMPORTANT: eBPF programs must load into the HOST kernel.
+# The container must run with --privileged and --network host so that:
+#   • The XDP program is loaded into the real host NIC
+#   • eBPF maps are accessible in the host kernel context
+#
+# Usage:
+#   docker compose up nat          # foreground, print stats
+#   docker compose up -d nat       # daemon / background cleanup loop
+#   docker compose run nat --conns # dump active NAT sessions
+#   docker compose run nat --stats # print counters
+# ────────────────────────────────────────────────────────────────────────────
+
+x-nat-base: &nat-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: nat-ebpf-xdp:latest
+  network_mode: host
+  privileged: true
+  volumes:
+    - /sys/fs/bpf:/sys/fs/bpf          # BPF filesystem (pin maps)
+    - /proc:/proc:ro                    # proc access for kernel info
+
+services:
+
+  # ── Primary service: attach + daemon cleanup loop ─────────────────────────
+  nat:
+    <<: *nat-base
+    container_name: xdp-nat
+    restart: unless-stopped
+    command:
+      - --interface
+      - "${IFACE:-eth0}"
+      - --network
+      - "${INT_NETWORK:-192.168.1.0/24}"
+      - --external-ip
+      - "${EXT_IP:-203.0.113.1}"
+      - --port-start
+      - "${PORT_START:-10000}"
+      - --port-end
+      - "${PORT_END:-20000}"
+      - --tcp-timeout
+      - "${TCP_TIMEOUT:-7440}"
+      - --udp-timeout
+      - "${UDP_TIMEOUT:-300}"
+      - --daemon
+    environment:
+      - IFACE=${IFACE:-eth0}
+      - INT_NETWORK=${INT_NETWORK:-192.168.1.0/24}
+      - EXT_IP=${EXT_IP:-203.0.113.1}
+
+  # ── Monitor mode: stream ring-buffer events to stdout ─────────────────────
+  monitor:
+    <<: *nat-base
+    container_name: xdp-nat-monitor
+    profiles: [monitor]
+    command:
+      - --interface
+      - "${IFACE:-eth0}"
+      - --network
+      - "${INT_NETWORK:-192.168.1.0/24}"
+      - --external-ip
+      - "${EXT_IP:-203.0.113.1}"
+      - --log-events
+      - --monitor
+
+  # ── Stats: print counters and exit ────────────────────────────────────────
+  stats:
+    <<: *nat-base
+    container_name: xdp-nat-stats
+    profiles: [stats]
+    restart: "no"
+    command:
+      - --interface
+      - "${IFACE:-eth0}"
+      - --stats
+      - --json

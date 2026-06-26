@@ -1,5 +1,10 @@
 # eBPF XDP NAT
 
+[![CI](https://github.com/SepehrImanian/nat-ebpf-xdp/actions/workflows/ci.yml/badge.svg)](https://github.com/SepehrImanian/nat-ebpf-xdp/actions/workflows/ci.yml)
+[![License: GPL-2.0](https://img.shields.io/badge/License-GPL--2.0-blue.svg)](LICENSE)
+[![Kernel](https://img.shields.io/badge/kernel-%E2%89%A5%205.8-brightgreen)](https://www.kernel.org/)
+[![eBPF](https://img.shields.io/badge/eBPF-XDP-orange)](https://ebpf.io/)
+
 High-performance Network Address Translation (SNAT/DNAT) implemented as an
 eBPF XDP program.  Packets are translated at the XDP hook — before the kernel
 network stack sees them — giving near line-rate throughput with minimal CPU
@@ -9,32 +14,44 @@ overhead.
 
 ## Architecture
 
-```
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  NIC driver                                                      │
-  │  ┌──────────────────────────────────────────────────────────┐   │
-  │  │  XDP hook  (xdp_nat_prog)                                │   │
-  │  │                                                          │   │
-  │  │  Outbound (internal → external)                          │   │
-  │  │    src_ip:src_port  ──SNAT──►  nat_ip:nat_port           │   │
-  │  │    written to nat_table (fwd) + nat_reverse_table        │   │
-  │  │                                                          │   │
-  │  │  Inbound (external → internal)                           │   │
-  │  │    dst_ip:dst_port  ──DNAT──►  orig_ip:orig_port         │   │
-  │  │    looked up in nat_reverse_table                        │   │
-  │  │                                                          │   │
-  │  │  Unknown flows → XDP_PASS (kernel handles)               │   │
-  │  └──────────────────────────────────────────────────────────┘   │
-  └──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    NIC["NIC / eth0\ndriver XDP hook"]
 
-  eBPF Maps
-  ─────────
-  nat_table        LRU_HASH  internal 5-tuple → nat_entry
-  nat_reverse_table LRU_HASH external 5-tuple → nat_entry
-  port_pool        ARRAY     port availability bitmap
-  stats_map        PERCPU_ARRAY  per-CPU counters
-  config_map       ARRAY     runtime configuration (1 entry)
-  event_ring       RINGBUF   connection lifecycle events
+    subgraph XDP["XDP Hook — xdp_nat_prog"]
+        direction LR
+        SNAT["SNAT  outbound\nsrc_ip:port → nat_ip:nat_port\nwrite nat_table + reverse_table"]
+        DNAT["DNAT  inbound\ndst_ip:nat_port → orig_ip:orig_port\nlookup reverse_table"]
+    end
+
+    KSTACK["Kernel Stack\nXDP_PASS flows\nsk_buff / routing"]
+
+    subgraph MAPS["eBPF Maps"]
+        direction LR
+        NT["nat_table\nLRU_HASH\nforward 5-tuple → entry"]
+        NR["reverse_table\nLRU_HASH\nexternal 5-tuple → entry"]
+        PP["port_pool\nARRAY  bitmap\n10 000 – 20 000"]
+        SM["stats_map\nPERCPU_ARRAY\ntx / rx / drop / err"]
+        ER["event_ring\nRINGBUF\nNEW / EXPIRED events"]
+    end
+
+    subgraph USR["Userspace — xdp_nat_user"]
+        direction LR
+        CTL["attach / detach\ncleanup daemon"]
+        STA["--stats\n--conns --json"]
+        MON["--monitor\nstream events"]
+    end
+
+    NIC -->|"rx packets"| XDP
+    SNAT -->|"XDP_TX  translated"| NIC
+    XDP  -->|"XDP_PASS"| KSTACK
+
+    SNAT --> NT & NR & PP
+    DNAT --> NR
+
+    NT & NR --> CTL
+    SM     --> STA
+    ER     --> MON
 ```
 
 ---
@@ -59,6 +76,65 @@ overhead.
 
 ---
 
+## Quick Install
+
+### One-liner (Ubuntu / Debian / Fedora)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SepehrImanian/nat-ebpf-xdp/main/install.sh | sudo bash
+```
+
+The script installs all dependencies, builds from source, and places
+`xdp_nat_user` in `/usr/local/bin` and `xdp_nat_kern.o` in `/usr/local/lib`.
+
+### Manual build
+
+```bash
+# Ubuntu / Debian
+sudo apt install clang llvm libbpf-dev linux-headers-$(uname -r) \
+                 libelf-dev zlib1g-dev git
+
+# Fedora / RHEL 9+
+sudo dnf install clang llvm libbpf-devel kernel-devel elfutils-libelf-devel git
+
+git clone https://github.com/SepehrImanian/nat-ebpf-xdp.git
+cd nat-ebpf-xdp
+make
+sudo make install
+```
+
+### Docker
+
+```bash
+# Build the image
+docker build -t nat-ebpf-xdp .
+
+# Run (requires privileged + host network — eBPF loads into the host kernel)
+docker run --rm --privileged --network host \
+  nat-ebpf-xdp \
+  --interface eth0 \
+  --network 192.168.1.0/24 \
+  --external-ip 203.0.113.1
+```
+
+### Docker Compose
+
+Copy `.env.example` to `.env` and set your interface / IPs, then:
+
+```bash
+# Start NAT daemon
+IFACE=eth0 INT_NETWORK=192.168.1.0/24 EXT_IP=203.0.113.1 \
+  docker compose up -d nat
+
+# Stream connection events
+docker compose --profile monitor up monitor
+
+# Print stats (JSON)
+docker compose --profile stats run stats
+```
+
+---
+
 ## Requirements
 
 | Requirement | Version |
@@ -69,31 +145,6 @@ overhead.
 | Privileges | `CAP_SYS_ADMIN` / root |
 | Kernel headers | matching running kernel |
 
-### Install dependencies (Ubuntu / Debian)
-
-```bash
-sudo apt install clang llvm libbpf-dev linux-headers-$(uname -r) \
-                 libelf-dev zlib1g-dev
-```
-
-### Install dependencies (Fedora / RHEL 9+)
-
-```bash
-sudo dnf install clang llvm libbpf-devel kernel-devel elfutils-libelf-devel
-```
-
----
-
-## Build
-
-```bash
-git clone <repo>
-cd nat-ebpf-xdp
-
-make          # builds xdp_nat_kern.o and xdp_nat_user
-make install  # installs to /usr/local/bin and /usr/local/lib
-```
-
 ---
 
 ## Usage
@@ -102,13 +153,13 @@ make install  # installs to /usr/local/bin and /usr/local/lib
 
 ```bash
 # Translate traffic from 192.168.1.0/24 to external IP 203.0.113.1 on eth0
-sudo ./xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1
+sudo xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1
 ```
 
 ### Custom port range and timeouts
 
 ```bash
-sudo ./xdp_nat_user \
+sudo xdp_nat_user \
     -i eth0 \
     -n 192.168.1.0/24 \
     -e 203.0.113.1 \
@@ -120,14 +171,14 @@ sudo ./xdp_nat_user \
 ### Daemon mode (background cleanup)
 
 ```bash
-sudo ./xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1 -d &
+sudo xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1 -d &
 ```
 
 ### Monitor new connections (ring buffer)
 
 ```bash
 # -L enables kernel-side event emission; -m consumes them
-sudo ./xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1 -L -m
+sudo xdp_nat_user -i eth0 -n 192.168.1.0/24 -e 203.0.113.1 -L -m
 ```
 
 Sample output:
@@ -140,7 +191,7 @@ Sample output:
 ### Dump active sessions
 
 ```bash
-sudo ./xdp_nat_user -i eth0 -c
+sudo xdp_nat_user -i eth0 -c
 ```
 
 ```
@@ -156,10 +207,10 @@ Int.IP:Port           Proto NAT IP:Port          Remote IP:Port        State Age
 
 ```bash
 # Human-readable
-sudo ./xdp_nat_user -i eth0 -S
+sudo xdp_nat_user -i eth0 -S
 
 # JSON (for monitoring pipelines)
-sudo ./xdp_nat_user -i eth0 -S -j
+sudo xdp_nat_user -i eth0 -S -j
 ```
 
 ### All CLI options
@@ -329,6 +380,10 @@ Re-attach the program: the XDP hook is bound to the interface index.
 | `xdp_nat_user.c` | Userspace control tool |
 | `Makefile` | Build, install, and test targets |
 | `test_nat.sh` | Integration tests using network namespaces |
+| `install.sh` | One-shot installer script |
+| `Dockerfile` | Multi-stage Docker build |
+| `docker-compose.yml` | Compose services (nat, monitor, stats) |
+| `.github/workflows/ci.yml` | GitHub Actions CI pipeline |
 
 ---
 
